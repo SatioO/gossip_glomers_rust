@@ -1,16 +1,18 @@
 mod node;
-use core::panic;
-use std::{collections::HashMap, fmt::Debug};
+mod storage;
+
+use std::{collections::HashMap, fmt::Debug, io::Write};
 
 use anyhow::Context;
-use node::Node;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::io::Write;
+use storage::Storage;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     sync::mpsc::{channel, Receiver, Sender},
     task,
 };
+
+use node::Node;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Message<Body> {
@@ -43,6 +45,14 @@ pub enum Payload {
         topology: HashMap<String, Vec<String>>,
     },
     TopologyOk {},
+    Broadcast {
+        message: u64,
+    },
+    BroadcastOk {},
+    Read {},
+    ReadOk {
+        messages: Vec<u64>,
+    },
 }
 
 // {"src":"c1","dest":"n1","body":{"type": "init","msg_id":1,"node_id": "n1", "node_ids": ["n1"]}}
@@ -51,12 +61,17 @@ pub enum Payload {
 async fn main() -> anyhow::Result<()> {
     let (reader_tx, mut reader_rx) = channel::<Message<Body>>(1);
     let (writer_tx, mut writer_rx) = channel::<Message<Body>>(1);
+
     let node = Node::default();
     let node = init_node(node, writer_tx.clone()).await;
 
+    let mut storage = Storage::default();
+
     let reader_task = task::spawn(async move { read_from_stdin(reader_tx).await });
     let handler_task =
-        task::spawn(async move { handle_messages(node, &mut reader_rx, writer_tx).await });
+        task::spawn(
+            async move { handle_messages(node, &mut storage, &mut reader_rx, writer_tx).await },
+        );
     let writer_task = task::spawn(async move { write_to_stdout(&mut writer_rx).await });
 
     let _ = tokio::try_join!(reader_task, handler_task, writer_task);
@@ -129,19 +144,49 @@ async fn write_to_stdout<T: Debug + Serialize>(writer_rx: &mut Receiver<T>) {
 
 async fn handle_messages(
     node: Node,
+    storage: &mut Storage,
     reader_rx: &mut Receiver<Message<Body>>,
     writer_tx: Sender<Message<Body>>,
 ) {
-    while let Some(message) = reader_rx.recv().await {
-        match message.body.payload {
+    while let Some(input) = reader_rx.recv().await {
+        match input.body.payload {
             Payload::Topology { .. } => {
                 let reply = Message {
                     src: node.id.clone(),
-                    dest: message.src,
+                    dest: input.src,
                     body: Body {
-                        id: message.body.id,
-                        in_reply_to: message.body.id,
+                        id: input.body.id,
+                        in_reply_to: input.body.id,
                         payload: Payload::TopologyOk {},
+                    },
+                };
+
+                writer_tx.send(reply).await.unwrap();
+            }
+            Payload::Broadcast { message, .. } => {
+                storage.add_message(message);
+                let reply = Message {
+                    src: node.id.clone(),
+                    dest: input.src,
+                    body: Body {
+                        id: input.body.id,
+                        in_reply_to: input.body.id,
+                        payload: Payload::BroadcastOk {},
+                    },
+                };
+
+                writer_tx.send(reply).await.unwrap();
+            }
+            Payload::Read {} => {
+                let reply = Message {
+                    src: node.id.clone(),
+                    dest: input.src,
+                    body: Body {
+                        id: input.body.id,
+                        in_reply_to: input.body.id,
+                        payload: Payload::ReadOk {
+                            messages: storage.get_messages(),
+                        },
                     },
                 };
 
