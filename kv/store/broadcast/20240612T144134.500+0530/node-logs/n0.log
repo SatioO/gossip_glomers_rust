@@ -1,0 +1,8 @@
+thread 'tokio-runtime-worker' panicked at src/main.rs:115:14:
+called `Result::unwrap()` on an `Err` value: Maelstrom input from STDIN could not be deserialized
+
+Caused by:
+    unknown variant `topology`, expected one of `init`, `init_ok`, `echo`, `echo_ok` at line 1 column 89
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+thread 'tokio-runtime-worker' panicked at src/main.rs:137:46:
+called `Option::unwrap()` on a `None` value

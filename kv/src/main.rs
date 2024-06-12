@@ -1,11 +1,13 @@
+mod node;
 use core::panic;
 use std::fmt::Debug;
 
 use anyhow::Context;
+use node::Node;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::Write;
 use tokio::{
-    io::AsyncBufReadExt,
+    io::{AsyncBufReadExt, BufReader},
     sync::mpsc::{channel, Receiver, Sender},
     task,
 };
@@ -20,7 +22,9 @@ pub struct Message<Body> {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Body {
     #[serde(rename = "msg_id")]
-    pub id: Option<String>,
+    pub id: Option<usize>,
+
+    pub in_reply_to: Option<usize>,
 
     #[serde(flatten)]
     pub payload: Payload,
@@ -30,19 +34,28 @@ pub struct Body {
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "type")]
 pub enum Payload {
-    Init {},
+    Init {
+        node_id: String,
+        node_ids: Vec<String>,
+    },
     InitOk {},
-    Echo { echo: String },
-    EchoOk { echo: String },
+    Echo {
+        echo: String,
+    },
+    EchoOk {
+        echo: String,
+    },
 }
 
-// {"src":"c1","dest":"n1","body":{"type": "init","msg_id":"1"}}
-// {"src":"c1","dest":"n1","body":{"type": "echo","msg_id":"1","echo":"Echo Hello World"}}
+// {"src":"c1","dest":"n1","body":{"type": "init","msg_id":1,"node_id": "n1", "node_ids": ["n1"]}}
+// {"src":"c1","dest":"n1","body":{"type": "echo","msg_id":1,"echo":"Echo Hello World"}}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (writer_tx, mut writer_rx) = channel::<Message<Body>>(1);
     let (reader_tx, mut reader_rx) = channel::<Message<Body>>(1);
+    let (writer_tx, mut writer_rx) = channel::<Message<Body>>(1);
+    let node = Node::default();
+    let node = init_node(node, writer_tx.clone()).await;
 
     let reader_task = task::spawn(async move { read_from_stdin(reader_tx).await });
     let handler_task = task::spawn(async move { handle_messages(&mut reader_rx, writer_tx).await });
@@ -53,9 +66,42 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn init_node(node: Node, writer_tx: Sender<Message<Body>>) -> Node {
+    let stdin = tokio::io::stdin();
+
+    let mut reader = BufReader::new(stdin);
+    let mut buf = String::new();
+
+    reader.read_line(&mut buf).await.unwrap();
+    let message = serde_json::from_str::<Message<Body>>(&buf)
+        .context("Maelstrom input from STDIN could not be deserialized")
+        .unwrap();
+
+    let node = node.init(message.clone());
+
+    match message.body.payload {
+        Payload::Init { node_id, .. } => {
+            let response = Message {
+                src: node_id,
+                dest: message.src.clone(),
+                body: Body {
+                    id: Some(0),
+                    in_reply_to: message.body.id,
+                    payload: Payload::InitOk {},
+                },
+            };
+
+            writer_tx.send(response).await.unwrap();
+        }
+        _ => (),
+    }
+
+    node
+}
+
 async fn read_from_stdin<T: Debug + DeserializeOwned>(reader_tx: Sender<T>) {
     let stdin = tokio::io::stdin();
-    let mut reader = tokio::io::BufReader::new(stdin);
+    let mut reader = BufReader::new(stdin);
 
     loop {
         let mut buf = String::new();
@@ -90,14 +136,11 @@ async fn handle_messages(
     loop {
         let message = reader_rx.recv().await.unwrap();
         match message.body.payload {
-            Payload::Init {} => {
-                writer_tx.send(message).await.unwrap();
-            }
             Payload::Echo { echo } => {
                 println!("echo: {:?}", echo)
             }
             _ => {
-                panic!("invalid type")
+                panic!("unknown variant")
             }
         }
     }
