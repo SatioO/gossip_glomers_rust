@@ -1,6 +1,6 @@
 mod node;
 use core::panic;
-use std::fmt::Debug;
+use std::{collections::HashMap, fmt::Debug};
 
 use anyhow::Context;
 use node::Node;
@@ -39,17 +39,14 @@ pub enum Payload {
         node_ids: Vec<String>,
     },
     InitOk {},
-    Echo {
-        echo: String,
+    Topology {
+        topology: HashMap<String, Vec<String>>,
     },
-    EchoOk {
-        echo: String,
-    },
+    TopologyOk {},
 }
 
 // {"src":"c1","dest":"n1","body":{"type": "init","msg_id":1,"node_id": "n1", "node_ids": ["n1"]}}
 // {"src":"c1","dest":"n1","body":{"type": "echo","msg_id":1,"echo":"Echo Hello World"}}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let (reader_tx, mut reader_rx) = channel::<Message<Body>>(1);
@@ -137,14 +134,14 @@ async fn handle_messages(
 ) {
     while let Some(message) = reader_rx.recv().await {
         match message.body.payload {
-            Payload::Echo { echo } => {
+            Payload::Topology { .. } => {
                 let reply = Message {
                     src: node.id.clone(),
                     dest: message.src,
                     body: Body {
-                        id: Some(0),
+                        id: message.body.id,
                         in_reply_to: message.body.id,
-                        payload: Payload::EchoOk { echo },
+                        payload: Payload::TopologyOk {},
                     },
                 };
 
