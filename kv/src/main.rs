@@ -58,7 +58,8 @@ async fn main() -> anyhow::Result<()> {
     let node = init_node(node, writer_tx.clone()).await;
 
     let reader_task = task::spawn(async move { read_from_stdin(reader_tx).await });
-    let handler_task = task::spawn(async move { handle_messages(&mut reader_rx, writer_tx).await });
+    let handler_task =
+        task::spawn(async move { handle_messages(node, &mut reader_rx, writer_tx).await });
     let writer_task = task::spawn(async move { write_to_stdout(&mut writer_rx).await });
 
     let _ = tokio::try_join!(reader_task, handler_task, writer_task);
@@ -81,7 +82,7 @@ async fn init_node(node: Node, writer_tx: Sender<Message<Body>>) -> Node {
 
     match message.body.payload {
         Payload::Init { node_id, .. } => {
-            let response = Message {
+            let reply = Message {
                 src: node_id,
                 dest: message.src.clone(),
                 body: Body {
@@ -91,7 +92,7 @@ async fn init_node(node: Node, writer_tx: Sender<Message<Body>>) -> Node {
                 },
             };
 
-            writer_tx.send(response).await.unwrap();
+            writer_tx.send(reply).await.unwrap();
         }
         _ => (),
     }
@@ -130,14 +131,24 @@ async fn write_to_stdout<T: Debug + Serialize>(writer_rx: &mut Receiver<T>) {
 }
 
 async fn handle_messages(
+    node: Node,
     reader_rx: &mut Receiver<Message<Body>>,
     writer_tx: Sender<Message<Body>>,
 ) {
-    loop {
-        let message = reader_rx.recv().await.unwrap();
+    while let Some(message) = reader_rx.recv().await {
         match message.body.payload {
             Payload::Echo { echo } => {
-                println!("echo: {:?}", echo)
+                let reply = Message {
+                    src: node.id.clone(),
+                    dest: message.src,
+                    body: Body {
+                        id: Some(0),
+                        in_reply_to: message.body.id,
+                        payload: Payload::EchoOk { echo },
+                    },
+                };
+
+                writer_tx.send(reply).await.unwrap();
             }
             _ => {
                 panic!("unknown variant")
