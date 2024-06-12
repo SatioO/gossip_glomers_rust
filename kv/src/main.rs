@@ -1,13 +1,14 @@
 use core::panic;
-use std::{
-    fmt::Debug,
-    io::Write,
-    sync::mpsc::{self, Receiver, Sender},
-};
+use std::fmt::Debug;
 
 use anyhow::Context;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio::task;
+use std::io::Write;
+use tokio::{
+    io::AsyncBufReadExt,
+    sync::mpsc::{channel, Receiver, Sender},
+    task,
+};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Message<Body> {
@@ -37,39 +38,60 @@ pub enum Payload {
 
 // {"src":"c1","dest":"n1","body":{"type": "init","msg_id":"1"}}
 // {"src":"c1","dest":"n1","body":{"type": "echo","msg_id":"1","echo":"Echo Hello World"}}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (reader_tx, reader_rx) = mpsc::channel::<Message<Body>>();
-    let (writer_tx, writer_rx) = mpsc::channel::<Message<Body>>();
+    let (writer_tx, mut writer_rx) = channel::<Message<Body>>(1);
+    let (reader_tx, mut reader_rx) = channel::<Message<Body>>(1);
 
-    task::spawn(async move {
-        if let Err(err) = StdPrinter::reader(reader_tx) {
-            println!("error: {:?}", err);
-        }
-    });
+    let reader_task = task::spawn(async move { read_from_stdin(reader_tx).await });
+    let handler_task = task::spawn(async move { handle_messages(&mut reader_rx, writer_tx).await });
+    let writer_task = task::spawn(async move { write_to_stdout(&mut writer_rx).await });
 
-    task::spawn(async move {
-        if let Err(err) = handle_messages(reader_rx, writer_tx) {
-            println!("error: {:?}", err);
-        }
-    });
-
-    if let Err(err) = StdPrinter::writer(writer_rx) {
-        println!("error: {:?}", err);
-    }
+    let _ = tokio::try_join!(reader_task, handler_task, writer_task);
 
     Ok(())
 }
 
-fn handle_messages(
-    reader_rx: Receiver<Message<Body>>,
-    _writer_tx: Sender<Message<Body>>,
-) -> anyhow::Result<()> {
-    for message in reader_rx {
+async fn read_from_stdin<T: Debug + DeserializeOwned>(reader_tx: Sender<T>) {
+    let stdin = tokio::io::stdin();
+    let mut reader = tokio::io::BufReader::new(stdin);
+
+    loop {
+        let mut buf = String::new();
+        reader
+            .read_line(&mut buf)
+            .await
+            .context("Failed to read from stdin")
+            .unwrap();
+        let input = serde_json::from_str::<T>(&buf)
+            .context("Maelstrom input from STDIN could not be deserialized")
+            .unwrap();
+
+        reader_tx.send(input).await.unwrap();
+    }
+}
+
+async fn write_to_stdout<T: Debug + Serialize>(writer_rx: &mut Receiver<T>) {
+    let mut stdout = std::io::stdout();
+
+    loop {
+        let message = writer_rx.recv().await.unwrap();
+        let ser = serde_json::to_string(&message).unwrap();
+        writeln!(stdout, "{}", ser).unwrap();
+        stdout.flush().unwrap();
+    }
+}
+
+async fn handle_messages(
+    reader_rx: &mut Receiver<Message<Body>>,
+    writer_tx: Sender<Message<Body>>,
+) {
+    loop {
+        let message = reader_rx.recv().await.unwrap();
         match message.body.payload {
             Payload::Init {} => {
-                println!("init");
-                _writer_tx.send(message)?;
+                writer_tx.send(message).await.unwrap();
             }
             Payload::Echo { echo } => {
                 println!("echo: {:?}", echo)
@@ -78,48 +100,5 @@ fn handle_messages(
                 panic!("invalid type")
             }
         }
-    }
-
-    Ok(())
-}
-
-pub trait IOManager<T>
-where
-    T: Debug + Serialize + DeserializeOwned + Send,
-{
-    fn reader(ch: Sender<T>) -> anyhow::Result<()>;
-    fn writer(ch: Receiver<T>) -> anyhow::Result<()>;
-}
-
-struct StdPrinter;
-impl<T> IOManager<T> for StdPrinter
-where
-    T: Debug + Serialize + DeserializeOwned + Send,
-{
-    fn reader(ch: Sender<T>) -> anyhow::Result<()> {
-        for line in std::io::stdin().lines() {
-            let line = line.context("Maelstrom input from STDIN could not be read")?;
-            let input = serde_json::from_str::<T>(&line)
-                .context("Maelstrom input from STDIN could not be deserialized")?;
-
-            if let Err(_) = ch.send(input) {
-                return Ok::<_, anyhow::Error>(());
-            }
-        }
-
-        Ok(())
-    }
-
-    fn writer(ch: Receiver<T>) -> anyhow::Result<()> {
-        let mut stdout = std::io::stdout();
-
-        for message in ch {
-            let data =
-                serde_json::to_string(&message).context("Message could not be serialized")?;
-            writeln!(stdout, "{}", data).unwrap();
-            stdout.flush().unwrap();
-        }
-
-        Ok(())
     }
 }
